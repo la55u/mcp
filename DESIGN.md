@@ -75,6 +75,20 @@ export const { getAuthRequest, authorize, listConnections, revokeConnection,
 - `userId` is always from the verified token; tool handlers never trust
   arguments for identity.
 
+## Resources
+
+- Optional `resources: { list?, templates?, read }`, advertised as the
+  `resources` capability only when set (`listChanged: false`; no
+  `subscribe`, which 2026-07-28 replaced with `subscriptions/listen`).
+- `list`/`templates` may be omitted: the spec allows resources that are only
+  discovered through tool metadata.
+- Entries are opaque: whatever the handler returns is sent as-is, `_meta`
+  included. Handlers receive the verified `user`, so scoping is theirs.
+- `read` returning `null` → `-32602` on 2026-07-28, `-32002` before it
+  (SEP-2164), with the URI in `error.data`.
+- `ttlMs`/`cacheScope` on the modern path only (SEP-2549): the TTL used for
+  tool lists for `resources/list`, `ttlMs: 0` + `private` for `resources/read`.
+
 ## Protocol
 
 - **Dual-era.** Requests carrying `_meta["io.modelcontextprotocol/protocolVersion"]`
