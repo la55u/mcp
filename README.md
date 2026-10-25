@@ -298,6 +298,29 @@ sees and can call tools in its granted scopes. A call outside those scopes
 gets HTTP 403 `insufficient_scope`. When a client requests no scope, the
 connection gets all of them.
 
+### Resources
+
+Serve `resources/list`, `resources/templates/list` and `resources/read` by
+passing `resources`. Entries go to the client as-is, so `_meta`, `title`, `size`
+and `annotations` survive; leave the option out and the server stays tools-only
+(the `resources` capability is not advertised).
+
+```ts
+resources: {
+  list: [{ uri: "ui://demo/chart", name: "chart", mimeType: "text/html;profile=mcp-app" }],
+  read: async (ctx, uri, user) => {
+    if (uri !== "ui://demo/chart") return null;
+    return { contents: [{ uri, mimeType: "text/html;profile=mcp-app", text: html }] };
+  },
+},
+```
+
+`list` and `templates` are optional — the spec lets UI-only resources stay
+unlisted. Handlers get the verified connection's `user`, so scope what you
+return the same way internal functions check access. Returning `null` from
+`read` becomes `Resource not found`: `-32602` on MCP 2026-07-28 and `-32002` on
+earlier revisions. `ttlMs`/`cacheScope` are added on the 2026-07-28 path only.
+
 ## Authorization
 
 The component authenticates the connection and gives your tool the verified

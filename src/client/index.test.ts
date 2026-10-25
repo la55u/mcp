@@ -277,12 +277,137 @@ describe("MCP 2026-07-28 (stateless)", () => {
     expect(ping.body.error.code).toBe(-32601);
   });
 
+  test("resources: cache hints on the modern path, -32602 for unknown URIs", async () => {
+    const srv = new McpServer(components.mcp, {
+      name: "test",
+      version: "1",
+      consentUrl: "https://app.example/connect",
+      siteUrl: "https://site.example",
+      scopes: { read: "Read" },
+      tools: {},
+      resources: {
+        list: [{ uri: "ui://demo/chart", name: "chart" }],
+        read: async (_ctx, uri) =>
+          uri === "ui://demo/chart"
+            ? {
+                contents: [
+                  {
+                    uri,
+                    mimeType: "text/html;profile=mcp-app",
+                    text: "<p>hi</p>",
+                    _meta: { ui: { prefersBorder: false } },
+                  },
+                ],
+              }
+            : null,
+      },
+    });
+
+    const list = await modern(srv, "resources/list");
+    expect(list.body.result).toMatchObject({
+      resources: [{ uri: "ui://demo/chart" }],
+      cacheScope: "private",
+    });
+    expect(list.body.result.ttlMs).toBeGreaterThan(0);
+
+    const read = await modern(
+      srv,
+      "resources/read",
+      { uri: "ui://demo/chart" },
+      { "Mcp-Name": "ui://demo/chart" },
+    );
+    expect(read.body.result).toMatchObject({
+      contents: [{ uri: "ui://demo/chart", _meta: { ui: { prefersBorder: false } } }],
+      ttlMs: 0,
+      cacheScope: "private",
+    });
+
+    const missing = await modern(
+      srv,
+      "resources/read",
+      { uri: "ui://nope" },
+      { "Mcp-Name": "ui://nope" },
+    );
+    expect(missing.body.error.code).toBe(-32602);
+    expect(missing.body.error.data).toEqual({ uri: "ui://nope" });
+  });
+
   test("legacy clients still initialize", async () => {
     const r = await call(s(), ctx(), rpc("initialize", { protocolVersion: "2025-11-25" }), "2025-11-25");
     expect(r.body.result.protocolVersion).toBe("2025-11-25");
     // A legacy client asking for an unknown version gets the latest legacy one.
     const r2 = await call(s(), ctx(), rpc("initialize", { protocolVersion: "2026-07-28" }), "2025-06-18");
     expect(r2.body.result.protocolVersion).toBe("2025-11-25");
+  });
+});
+
+describe("resources", () => {
+  const serverWithResources = () =>
+    new McpServer(components.mcp, {
+      name: "test",
+      version: "1",
+      consentUrl: "https://app.example/connect",
+      siteUrl: "https://site.example",
+      scopes: { read: "Read", write: "Write" },
+      tools: {},
+      resources: {
+        list: [
+          { uri: "ui://demo/chart", name: "chart", mimeType: "text/html;profile=mcp-app" },
+          { uri: "file:///readme.md", name: "readme" },
+        ],
+        templates: [{ uriTemplate: "ui://demo/{id}", name: "demo" }],
+        read: async (_ctx, uri) =>
+          uri === "file:///readme.md"
+            ? { contents: [{ uri, mimeType: "text/markdown", text: "# hi" }] }
+            : null,
+      },
+    });
+
+  test("advertises the capability only when resources are configured", async () => {
+    const withResources = await call(server({}), ctx(), rpc("initialize", { protocolVersion: "2025-11-25" }));
+    expect(withResources.body.result.capabilities).toEqual({ tools: { listChanged: false } });
+
+    const configured = await call(
+      serverWithResources(),
+      ctx(),
+      rpc("initialize", { protocolVersion: "2025-11-25" }),
+    );
+    expect(configured.body.result.capabilities).toEqual({
+      tools: { listChanged: false },
+      resources: { listChanged: false },
+    });
+  });
+
+  test("lists resources and templates (legacy era, no cache hints)", async () => {
+    const s = serverWithResources();
+    const list = await call(s, ctx(), rpc("resources/list"));
+    expect(list.body.result.resources.map((r: any) => r.uri)).toEqual([
+      "ui://demo/chart",
+      "file:///readme.md",
+    ]);
+    expect(list.body.result.ttlMs).toBeUndefined();
+
+    const templates = await call(s, ctx(), rpc("resources/templates/list"));
+    expect(templates.body.result.resourceTemplates).toEqual([
+      { uriTemplate: "ui://demo/{id}", name: "demo" },
+    ]);
+  });
+
+  test("reads contents, and reports a missing resource with -32002", async () => {
+    const s = serverWithResources();
+    const found = await call(s, ctx(), rpc("resources/read", { uri: "file:///readme.md" }));
+    expect(found.body.result.contents).toEqual([
+      { uri: "file:///readme.md", mimeType: "text/markdown", text: "# hi" },
+    ]);
+
+    const missing = await call(s, ctx(), rpc("resources/read", { uri: "ui://demo/chart" }));
+    expect(missing.body.error.code).toBe(-32002);
+    expect(missing.body.error.data).toEqual({ uri: "ui://demo/chart" });
+  });
+
+  test("methods stay unimplemented when resources are not configured", async () => {
+    const r = await call(server({}), ctx(), rpc("resources/list"));
+    expect(r.body.error.code).toBe(-32601);
   });
 });
 
