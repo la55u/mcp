@@ -284,6 +284,27 @@ ok("code exchanged once for tokens; replay rejected");
   ok("argument validation and ConvexErrors become isError tool results");
 }
 
+// 7a. MCP Apps: a tool points at a ui:// view, which the host reads as a resource.
+{
+  const tools = (await rpc(accessToken, "tools/list", {})).body.result.tools;
+  const uri = tools.find((t) => t.name === "list_todos")._meta.ui.resourceUri;
+  assert.equal(uri, "ui://todos/list");
+  const listed = await rpc(accessToken, "resources/list", {});
+  assert.deepEqual(
+    listed.body.result.resources.map((r) => r.uri),
+    [uri],
+  );
+  const read = await rpc(accessToken, "resources/read", { uri });
+  const [view] = read.body.result.contents;
+  assert.equal(view.mimeType, "text/html;profile=mcp-app");
+  assert.match(view.text, /<!doctype html>/i);
+  const missing = await rpc(accessToken, "resources/read", {
+    uri: "ui://todos/nope",
+  });
+  assert.equal(missing.body.error.code, -32002);
+  ok("MCP Apps: list_todos links a ui:// view served over resources/read");
+}
+
 // 7b. MCP 2026-07-28: stateless requests with _meta and mirrored headers.
 {
   const META = "io.modelcontextprotocol/";

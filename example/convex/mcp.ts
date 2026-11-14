@@ -3,6 +3,11 @@ import { getAuthUserId } from "@convex-dev/auth/server";
 import { v } from "convex/values";
 import { components, internal } from "./_generated/api.js";
 import type { Id } from "./_generated/dataModel.js";
+import {
+  MCP_APP_MIME_TYPE,
+  TODOS_VIEW_URI,
+  todosViewHtml,
+} from "./todosView.js";
 
 // `user.userId` in handlers is typed as a users ID: no casts.
 const tool = createTool<Id<"users">>();
@@ -62,6 +67,8 @@ export const mcp: McpServer<Id<"users">> = new McpServer(components.mcp, {
       returns: v.object({ todos: v.array(todo) }),
       annotations: { readOnlyHint: true, openWorldHint: false },
       scope: "todos:read",
+      // MCP Apps hosts render the result with this view; others show the text.
+      meta: { ui: { resourceUri: TODOS_VIEW_URI } },
       handler: async (ctx, args, user) => ({
         todos: await ctx.runQuery(internal.mcpFunctions.todos, {
           user,
@@ -102,6 +109,31 @@ export const mcp: McpServer<Id<"users">> = new McpServer(components.mcp, {
         return `Deleted ${args.id}`;
       },
     }),
+  },
+  resources: {
+    list: [
+      {
+        uri: TODOS_VIEW_URI,
+        name: "todos_view",
+        title: "Todo list",
+        mimeType: MCP_APP_MIME_TYPE,
+      },
+    ],
+    // The view is static HTML with no user data: the data arrives with the
+    // tool result. A resource that returned user data would check access here.
+    read: (_ctx, uri) =>
+      uri === TODOS_VIEW_URI
+        ? {
+            contents: [
+              {
+                uri,
+                mimeType: MCP_APP_MIME_TYPE,
+                text: todosViewHtml,
+                _meta: { ui: { prefersBorder: true } },
+              },
+            ],
+          }
+        : null,
   },
 });
 

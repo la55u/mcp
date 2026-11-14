@@ -330,6 +330,25 @@ Resources have no `scope`: any connected user can call `read` with any URI.
 Handlers get the verified connection's `user`, so check access there, the same
 way internal functions do.
 
+### MCP Apps
+
+[MCP Apps](https://modelcontextprotocol.io/docs/extensions/apps) lets a tool
+render an interactive view in hosts that support it. Point the tool at a `ui://`
+resource with `meta`, and serve the HTML from `resources.read`:
+
+```ts
+list_todos: tool({
+  // ...
+  meta: { ui: { resourceUri: "ui://todos/list" } },
+}),
+```
+
+The host reads the view, renders it in a sandboxed iframe, and passes it the
+tool result over `postMessage`. Hosts without MCP Apps support ignore `_meta.ui`
+and show the tool's text content, so keep that meaningful. The example app's
+[`todosView.ts`](example/convex/todosView.ts) is a complete view with no
+dependencies.
+
 ## Authorization
 
 The component authenticates the connection and gives your tool the verified

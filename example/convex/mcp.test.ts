@@ -20,7 +20,7 @@ async function newUser(t: T, scopes?: string[]) {
     name: "test",
     scopes,
   });
-  const call = async (name: string, args: Record<string, unknown> = {}) => {
+  const rpc = async (method: string, params: Record<string, unknown> = {}) => {
     const res = await t.fetch("/mcp", {
       method: "POST",
       headers: {
@@ -31,13 +31,15 @@ async function newUser(t: T, scopes?: string[]) {
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
-        method: "tools/call",
-        params: { name, arguments: args },
+        method,
+        params,
       }),
     });
     return { status: res.status, body: await res.json() };
   };
-  return { userId, asUser, listId, apiKey, call };
+  const call = (name: string, args: Record<string, unknown> = {}) =>
+    rpc("tools/call", { name, arguments: args });
+  return { userId, asUser, listId, apiKey, call, rpc };
 }
 
 describe("MCP server in an app", () => {
@@ -124,6 +126,30 @@ describe("MCP server in an app", () => {
     // The tool itself is out of scope (403); the access helper would also refuse.
     const write = await a.call("add_todo", { listId: a.listId, text: "x" });
     expect(write.status).toBe(403);
+  });
+
+  test("list_todos points MCP Apps hosts at a view they can read", async () => {
+    const t = initConvexTest();
+    const a = await newUser(t);
+    const tools = (await a.rpc("tools/list")).body.result.tools;
+    const uri = tools.find((t: { name: string }) => t.name === "list_todos")
+      ._meta.ui.resourceUri;
+    expect(uri).toBe("ui://todos/list");
+
+    const listed = (await a.rpc("resources/list")).body.result.resources;
+    expect(listed).toEqual([
+      expect.objectContaining({ uri, mimeType: "text/html;profile=mcp-app" }),
+    ]);
+    const read = await a.rpc("resources/read", { uri });
+    const [view] = read.body.result.contents;
+    expect(view).toMatchObject({ uri, mimeType: "text/html;profile=mcp-app" });
+    expect(view.text).toContain("ui/initialize");
+
+    const missing = await a.rpc("resources/read", { uri: "ui://todos/nope" });
+    expect(missing.body.error).toMatchObject({
+      code: -32002,
+      data: { uri: "ui://todos/nope" },
+    });
   });
 
   test("connections can be listed and revoked", async () => {
