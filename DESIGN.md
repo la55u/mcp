@@ -92,8 +92,11 @@ export const {
 - Optional `resources: { list?, templates?, read }`, advertised as the
   `resources` capability only when set (`listChanged: false`; no `subscribe`,
   which 2026-07-28 replaced with `subscriptions/listen`).
-- `list`/`templates` may be omitted: the spec allows resources that are only
-  discovered through tool metadata.
+- `list`/`templates` may be omitted (served as empty, since the capability
+  promises the methods): the spec allows resources that are only discovered
+  through tool metadata.
+- No scopes: access control is the handlers' job. A non-string `uri` is
+  `-32602`; a throwing handler is a generic `-32603`, logged server-side.
 - Entries are opaque: whatever the handler returns is sent as-is, `_meta`
   included. Handlers receive the verified `user`, so scoping is theirs.
 - `read` returning `null` → `-32602` on 2026-07-28, `-32002` before it

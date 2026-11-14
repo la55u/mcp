@@ -789,44 +789,24 @@ export class McpServer<UserId extends string = string> {
           await this.callTool(ctx, t, params.arguments ?? {}, user),
         );
       }
-      case "resources/list": {
-        const resources = await this.listResources(ctx, user);
-        if (!resources) {
-          return json(rpcError(id, -32601, `Method not found: ${method}`), 404);
-        }
-        return result({
-          resources,
-          ttlMs: TOOLS_LIST_TTL_MS,
-          // The list depends on the caller's connection.
-          cacheScope: "private",
-        });
-      }
-      case "resources/templates/list": {
-        const resourceTemplates = await this.listResourceTemplates(ctx, user);
-        if (!resourceTemplates) {
-          return json(rpcError(id, -32601, `Method not found: ${method}`), 404);
-        }
-        return result({
-          resourceTemplates,
-          ttlMs: TOOLS_LIST_TTL_MS,
-          cacheScope: "private",
-        });
-      }
+      case "resources/list":
+      case "resources/templates/list":
       case "resources/read": {
-        const read = await this.readResource(ctx, params.uri, user);
-        if (read === null) {
-          // SEP-2164: -32602 from 2026-07-28, -32002 before it.
-          return json(
-            rpcError(id, -32602, "Resource not found", { uri: params.uri }),
-            200,
-          );
+        if (!this.options.resources) break;
+        const r = await this.handleResources(ctx, method, params, user, true);
+        if ("error" in r) {
+          const { code, message, data } = r.error;
+          return json(rpcError(id, code, message, data), 200);
         }
-        // Contents depend on the user, and are not cached by default.
-        return result({ ...read, ttlMs: 0, cacheScope: "private" });
+        return result({
+          ...r.result,
+          // Lists depend on the caller's connection; contents are not cached by default.
+          ttlMs: method === "resources/read" ? 0 : TOOLS_LIST_TTL_MS,
+          cacheScope: "private",
+        });
       }
-      default:
-        return json(rpcError(id, -32601, `Method not found: ${method}`), 404);
     }
+    return json(rpcError(id, -32601, `Method not found: ${method}`), 404);
   }
 
   /** MCP 2025-03-26 through 2025-11-25 (initialize-based, stateless here). */
@@ -916,29 +896,19 @@ export class McpServer<UserId extends string = string> {
           await this.callTool(ctx, t, p.arguments ?? {}, user),
         );
       }
-      case "resources/list": {
-        const resources = await this.listResources(ctx, user);
-        if (!resources)
-          return rpcError(id, -32601, `Method not found: ${method}`);
-        return rpcResult(id, { resources });
-      }
-      case "resources/templates/list": {
-        const resourceTemplates = await this.listResourceTemplates(ctx, user);
-        if (!resourceTemplates) {
-          return rpcError(id, -32601, `Method not found: ${method}`);
-        }
-        return rpcResult(id, { resourceTemplates });
-      }
+      case "resources/list":
+      case "resources/templates/list":
       case "resources/read": {
-        const read = await this.readResource(ctx, p.uri, user);
-        if (read === null) {
-          return rpcError(id, -32002, "Resource not found", { uri: p.uri });
+        if (!this.options.resources) break;
+        const r = await this.handleResources(ctx, method, p, user, false);
+        if ("error" in r) {
+          const { code, message, data } = r.error;
+          return rpcError(id, code, message, data);
         }
-        return rpcResult(id, read);
+        return rpcResult(id, r.result);
       }
-      default:
-        return rpcError(id, -32601, `Method not found: ${method}`);
     }
+    return rpcError(id, -32601, `Method not found: ${method}`);
   }
 
   private get serverInfo() {
@@ -956,29 +926,59 @@ export class McpServer<UserId extends string = string> {
     };
   }
 
-  /** Resources for this connection, or undefined when none are configured. */
-  private async listResources(ctx: ToolCtx, user: McpUser<UserId>) {
-    const { list } = this.options.resources ?? {};
-    if (list === undefined) return undefined;
-    return typeof list === "function" ? await list(ctx, user) : list;
-  }
-
-  private async listResourceTemplates(ctx: ToolCtx, user: McpUser<UserId>) {
-    const { templates } = this.options.resources ?? {};
-    if (templates === undefined) return undefined;
-    return typeof templates === "function"
-      ? await templates(ctx, user)
-      : templates;
-  }
-
-  /** Contents for `uri`, or null when the handler does not know it. */
-  private async readResource(
+  /**
+   * `resources/*` for both eras. Unset `list`/`templates` are empty, since the
+   * capability promises the methods even when every resource is unlisted.
+   */
+  private async handleResources(
     ctx: ToolCtx,
-    uri: unknown,
+    method: "resources/list" | "resources/templates/list" | "resources/read",
+    params: Record<string, unknown>,
     user: McpUser<UserId>,
-  ): Promise<ReadResourceResult | null> {
-    if (!this.options.resources || typeof uri !== "string") return null;
-    return await this.options.resources.read(ctx, uri, user);
+    modern: boolean,
+  ): Promise<
+    | { result: Record<string, unknown> }
+    | { error: { code: number; message: string; data?: unknown } }
+  > {
+    const { list, templates, read } = this.options.resources!;
+    const uri = params.uri;
+    if (method === "resources/read" && typeof uri !== "string") {
+      return {
+        error: {
+          code: -32602,
+          message: "Invalid params: uri must be a string",
+        },
+      };
+    }
+    try {
+      if (method === "resources/list") {
+        const resources =
+          typeof list === "function" ? await list(ctx, user) : (list ?? []);
+        return { result: { resources } };
+      }
+      if (method === "resources/templates/list") {
+        const resourceTemplates =
+          typeof templates === "function"
+            ? await templates(ctx, user)
+            : (templates ?? []);
+        return { result: { resourceTemplates } };
+      }
+      const contents = await read(ctx, uri as string, user);
+      if (contents === null) {
+        // SEP-2164: -32602 from 2026-07-28, -32002 before it.
+        return {
+          error: {
+            code: modern ? -32602 : -32002,
+            message: "Resource not found",
+            data: { uri },
+          },
+        };
+      }
+      return { result: { ...contents } };
+    } catch (error) {
+      console.error(`MCP ${method} failed`, error);
+      return { error: { code: -32603, message: "Internal error" } };
+    }
   }
 
   /** Tools visible to this connection, in definition order (deterministic). */

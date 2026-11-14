@@ -321,10 +321,14 @@ resources: {
 ```
 
 `list` and `templates` are optional — the spec lets UI-only resources stay
-unlisted. Handlers get the verified connection's `user`, so scope what you
-return the same way internal functions check access. Returning `null` from
-`read` becomes `Resource not found`: `-32602` on MCP 2026-07-28 and `-32002` on
-earlier revisions. `ttlMs`/`cacheScope` are added on the 2026-07-28 path only.
+unlisted, and an unset list is served as empty. Returning `null` from `read`
+becomes `Resource not found`: `-32602` on MCP 2026-07-28 and `-32002` on earlier
+revisions. A handler that throws becomes a generic `-32603` (the error is
+logged, not sent). `ttlMs`/`cacheScope` are added on the 2026-07-28 path only.
+
+Resources have no `scope`: any connected user can call `read` with any URI.
+Handlers get the verified connection's `user`, so check access there, the same
+way internal functions do.
 
 ## Authorization
 

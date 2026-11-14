@@ -453,6 +453,15 @@ describe("MCP 2026-07-28 (stateless)", () => {
     );
     expect(missing.body.error.code).toBe(-32602);
     expect(missing.body.error.data).toEqual({ uri: "ui://nope" });
+
+    const unconfigured = await modern(
+      server({}),
+      "resources/read",
+      { uri: "ui://demo/chart" },
+      { "Mcp-Name": "ui://demo/chart" },
+    );
+    expect(unconfigured.status).toBe(404);
+    expect(unconfigured.body.error.code).toBe(-32601);
   });
 
   test("legacy clients still initialize", async () => {
@@ -592,6 +601,56 @@ describe("resources", () => {
     );
     expect(missing.body.error.code).toBe(-32002);
     expect(missing.body.error.data).toEqual({ uri: "ui://demo/chart" });
+  });
+
+  test("with only read, lists are empty rather than missing", async () => {
+    const s = new McpServer(components.mcp, {
+      name: "test",
+      version: "1",
+      consentUrl: "https://app.example/connect",
+      siteUrl: "https://site.example",
+      tools: {},
+      resources: { read: async () => null },
+    });
+    const list = await call(s, ctx(), rpc("resources/list"));
+    expect(list.body.result.resources).toEqual([]);
+    const templates = await call(s, ctx(), rpc("resources/templates/list"));
+    expect(templates.body.result.resourceTemplates).toEqual([]);
+  });
+
+  test("a uri that is not a string is invalid params, not a missing resource", async () => {
+    const s = serverWithResources();
+    for (const params of [{}, { uri: 42 }]) {
+      const r = await call(s, ctx(), rpc("resources/read", params));
+      expect(r.body.error.code).toBe(-32602);
+      expect(r.body.error.data).toBeUndefined();
+    }
+  });
+
+  test("a throwing handler is an internal error that does not leak", async () => {
+    const s = new McpServer(components.mcp, {
+      name: "test",
+      version: "1",
+      consentUrl: "https://app.example/connect",
+      siteUrl: "https://site.example",
+      tools: {},
+      resources: {
+        list: async () => {
+          throw new Error("db password is hunter2");
+        },
+        read: async () => {
+          throw new Error("db password is hunter2");
+        },
+      },
+    });
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const read = await call(s, ctx(), rpc("resources/read", { uri: "ui://x" }));
+    const list = await call(s, ctx(), rpc("resources/list"));
+    spy.mockRestore();
+    for (const r of [read, list]) {
+      expect(r.body.error.code).toBe(-32603);
+      expect(JSON.stringify(r.body)).not.toContain("hunter2");
+    }
   });
 
   test("methods stay unimplemented when resources are not configured", async () => {
