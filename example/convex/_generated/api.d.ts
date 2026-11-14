@@ -15,6 +15,7 @@ import type * as lists from "../lists.js";
 import type * as mcp from "../mcp.js";
 import type * as mcpFunctions from "../mcpFunctions.js";
 import type * as todos from "../todos.js";
+import type * as todosView from "../todosView.js";
 
 import type {
   ApiFromModules,
@@ -30,6 +31,7 @@ declare const fullApi: ApiFromModules<{
   mcp: typeof mcp;
   mcpFunctions: typeof mcpFunctions;
   todos: typeof todos;
+  todosView: typeof todosView;
 }>;
 
 /**
