@@ -126,6 +126,63 @@ export function callToolResult(result: CallToolResult) {
   return { [RESULT]: true, ...result } as CallToolResult & { [RESULT]: true };
 }
 
+/**
+ * A resource entry, sent to the client verbatim. Fields the component does not
+ * read (`title`, `size`, `annotations`, `_meta`, …) are passed through, so the
+ * shape is whatever the MCP revision allows.
+ * https://modelcontextprotocol.io/specification/2025-11-25/server/resources
+ */
+export type ResourceEntry = {
+  uri: string;
+  name: string;
+  [field: string]: unknown;
+};
+
+/** A parameterised resource (RFC 6570 URI template). */
+export type ResourceTemplateEntry = {
+  uriTemplate: string;
+  name: string;
+  [field: string]: unknown;
+};
+
+/** One entry of a `resources/read` result. */
+export type ResourceContents = {
+  uri: string;
+  mimeType?: string;
+  text?: string;
+  blob?: string;
+  [field: string]: unknown;
+};
+
+export type ReadResourceResult = { contents: ResourceContents[] };
+
+/**
+ * Resources this server exposes. `list` and `templates` are optional: the spec
+ * lets servers omit resources that are only discovered through tool metadata.
+ * Handlers get the verified connection's `user`, so they scope results the same
+ * way internal functions do.
+ */
+export type ResourcesDefinition<UserId extends string = string> = {
+  list?:
+    | ResourceEntry[]
+    | ((
+        ctx: ToolCtx,
+        user: McpUser<UserId>,
+      ) => ResourceEntry[] | Promise<ResourceEntry[]>);
+  templates?:
+    | ResourceTemplateEntry[]
+    | ((
+        ctx: ToolCtx,
+        user: McpUser<UserId>,
+      ) => ResourceTemplateEntry[] | Promise<ResourceTemplateEntry[]>);
+  /** Return `null` when the URI does not exist (or this connection may not read it). */
+  read: (
+    ctx: ToolCtx,
+    uri: string,
+    user: McpUser<UserId>,
+  ) => ReadResourceResult | null | Promise<ReadResourceResult | null>;
+};
+
 export type ToolDefinition<
   Args extends PropertyValidators = PropertyValidators,
   Returns extends GenericValidator | undefined = GenericValidator | undefined,
@@ -214,6 +271,12 @@ export type McpServerOptions<UserId extends string = string> = {
   siteUrl?: string;
   /** Path of the MCP endpoint. Default "/mcp". */
   path?: string;
+  /**
+   * Resources the server exposes over `resources/list`, `resources/templates/list`
+   * and `resources/read`. Omit to keep the server tools-only: the `resources`
+   * capability is advertised only when this is set.
+   */
+  resources?: ResourcesDefinition<UserId>;
   /** Optional OAuth scopes, mapped to a description for the consent page. */
   scopes?: Record<string, string>;
   /**
@@ -726,9 +789,24 @@ export class McpServer<UserId extends string = string> {
           await this.callTool(ctx, t, params.arguments ?? {}, user),
         );
       }
-      default:
-        return json(rpcError(id, -32601, `Method not found: ${method}`), 404);
+      case "resources/list":
+      case "resources/templates/list":
+      case "resources/read": {
+        if (!this.options.resources) break;
+        const r = await this.handleResources(ctx, method, params, user, true);
+        if ("error" in r) {
+          const { code, message, data } = r.error;
+          return json(rpcError(id, code, message, data), 200);
+        }
+        return result({
+          ...r.result,
+          // Lists depend on the caller's connection; contents are not cached by default.
+          ttlMs: method === "resources/read" ? 0 : TOOLS_LIST_TTL_MS,
+          cacheScope: "private",
+        });
+      }
     }
+    return json(rpcError(id, -32601, `Method not found: ${method}`), 404);
   }
 
   /** MCP 2025-03-26 through 2025-11-25 (initialize-based, stateless here). */
@@ -818,9 +896,19 @@ export class McpServer<UserId extends string = string> {
           await this.callTool(ctx, t, p.arguments ?? {}, user),
         );
       }
-      default:
-        return rpcError(id, -32601, `Method not found: ${method}`);
+      case "resources/list":
+      case "resources/templates/list":
+      case "resources/read": {
+        if (!this.options.resources) break;
+        const r = await this.handleResources(ctx, method, p, user, false);
+        if ("error" in r) {
+          const { code, message, data } = r.error;
+          return rpcError(id, code, message, data);
+        }
+        return rpcResult(id, r.result);
+      }
     }
+    return rpcError(id, -32601, `Method not found: ${method}`);
   }
 
   private get serverInfo() {
@@ -832,7 +920,65 @@ export class McpServer<UserId extends string = string> {
   }
 
   private get capabilities() {
-    return { tools: { listChanged: false } };
+    return {
+      tools: { listChanged: false },
+      ...(this.options.resources ? { resources: { listChanged: false } } : {}),
+    };
+  }
+
+  /**
+   * `resources/*` for both eras. Unset `list`/`templates` are empty, since the
+   * capability promises the methods even when every resource is unlisted.
+   */
+  private async handleResources(
+    ctx: ToolCtx,
+    method: "resources/list" | "resources/templates/list" | "resources/read",
+    params: Record<string, unknown>,
+    user: McpUser<UserId>,
+    modern: boolean,
+  ): Promise<
+    | { result: Record<string, unknown> }
+    | { error: { code: number; message: string; data?: unknown } }
+  > {
+    const { list, templates, read } = this.options.resources!;
+    const uri = params.uri;
+    if (method === "resources/read" && typeof uri !== "string") {
+      return {
+        error: {
+          code: -32602,
+          message: "Invalid params: uri must be a string",
+        },
+      };
+    }
+    try {
+      if (method === "resources/list") {
+        const resources =
+          typeof list === "function" ? await list(ctx, user) : (list ?? []);
+        return { result: { resources } };
+      }
+      if (method === "resources/templates/list") {
+        const resourceTemplates =
+          typeof templates === "function"
+            ? await templates(ctx, user)
+            : (templates ?? []);
+        return { result: { resourceTemplates } };
+      }
+      const contents = await read(ctx, uri as string, user);
+      if (contents === null) {
+        // SEP-2164: -32602 from 2026-07-28, -32002 before it.
+        return {
+          error: {
+            code: modern ? -32602 : -32002,
+            message: "Resource not found",
+            data: { uri },
+          },
+        };
+      }
+      return { result: { ...contents } };
+    } catch (error) {
+      console.error(`MCP ${method} failed`, error);
+      return { error: { code: -32603, message: "Internal error" } };
+    }
   }
 
   /** Tools visible to this connection, in definition order (deterministic). */
@@ -1704,8 +1850,17 @@ function rpcResult(id: string | number, result: unknown) {
   return { jsonrpc: "2.0", id, result };
 }
 
-function rpcError(id: string | number | null, code: number, message: string) {
-  return { jsonrpc: "2.0", id, error: { code, message } };
+function rpcError(
+  id: string | number | null,
+  code: number,
+  message: string,
+  data?: unknown,
+) {
+  return {
+    jsonrpc: "2.0",
+    id,
+    error: { code, message, ...(data === undefined ? {} : { data }) },
+  };
 }
 
 const PUBLIC_CORS: Record<string, string> = {
