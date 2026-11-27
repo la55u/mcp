@@ -407,3 +407,98 @@ describe("GET /mcp guide", () => {
     expect(open.guide()).toContain("secret_tool");
   });
 });
+
+describe("cache hints (SEP-2549)", () => {
+  const META = "io.modelcontextprotocol/";
+  async function modernPost(s: McpServer, method: string) {
+    const res = await s.handleMcp(
+      ctx(),
+      new Request("https://site.example/mcp", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer key",
+          "Content-Type": "application/json",
+          "MCP-Protocol-Version": "2026-07-28",
+          "Mcp-Method": method,
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method,
+          params: {
+            _meta: {
+              [`${META}protocolVersion`]: "2026-07-28",
+              [`${META}clientCapabilities`]: {},
+            },
+          },
+        }),
+      }),
+    );
+    return { status: res.status, body: await res.json() };
+  }
+
+  test("server/discover and tools/list honor configured ttlMs (including 0) and cacheScope", async () => {
+    const s = new McpServer(components.mcp, {
+      name: "test",
+      version: "1",
+      consentUrl: "https://app.example/connect",
+      siteUrl: "https://site.example",
+      warnings: false,
+      cache: {
+        discover: { ttlMs: 3_600_000, cacheScope: "private" },
+        toolsList: { ttlMs: 0, cacheScope: "public" },
+      },
+      tools: {
+        ping_tool: tool({ description: "Ping", handler: async () => "pong" }),
+      },
+    });
+
+    const discover = await modernPost(s, "server/discover");
+    expect(discover.body.result).toMatchObject({
+      ttlMs: 3_600_000,
+      cacheScope: "private",
+    });
+
+    const list = await modernPost(s, "tools/list");
+    expect(list.body.result).toMatchObject({
+      ttlMs: 0,
+      cacheScope: "public",
+    });
+
+    // Legacy responses do not emit SEP-2549 cache hints.
+    const legacy = await call(s, ctx(), rpc("tools/list"), "2025-11-25");
+    expect("ttlMs" in legacy.body.result).toBe(false);
+    expect("cacheScope" in legacy.body.result).toBe(false);
+  });
+
+  test("rejects negative or non-finite ttlMs and public toolsList when tools are scoped", () => {
+    for (const ttlMs of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(
+        () =>
+          new McpServer(components.mcp, {
+            name: "test",
+            version: "1",
+            consentUrl: "https://app.example/connect",
+            siteUrl: "https://site.example",
+            cache: { discover: { ttlMs } },
+            tools: {},
+          }),
+      ).toThrow(/ttlMs/);
+    }
+
+    expect(
+      () =>
+        new McpServer(components.mcp, {
+          name: "test",
+          version: "1",
+          consentUrl: "https://app.example/connect",
+          siteUrl: "https://site.example",
+          scopes: { read: "Read" },
+          cache: { toolsList: { cacheScope: "public" } },
+          tools: {
+            list: tool({ description: "List", scope: "read", handler: async () => [] }),
+          },
+        }),
+    ).toThrow(/cacheScope/);
+  });
+});

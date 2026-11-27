@@ -184,6 +184,20 @@ export function createTool<UserId extends string>() {
 // ---------------------------------------------------------------------------
 // Server
 
+/**
+ * Cache-scope marker advertised on MCP 2026-07-28 cacheable results (SEP-2549).
+ * `"public"` permits shared intermediary caching; `"private"` scopes caching to
+ * the caller's authorization context.
+ */
+export type CacheScope = "public" | "private";
+
+/** Freshness and sharing hint advertised on MCP 2026-07-28 responses (SEP-2549). */
+export type CacheHint = {
+  /** How long (in milliseconds) clients may cache the response. `0` means immediately stale. */
+  ttlMs?: number;
+  cacheScope?: CacheScope;
+};
+
 export type McpServerOptions<UserId extends string = string> = {
   /** Server name reported to clients in `serverInfo`. */
   name: string;
@@ -234,6 +248,16 @@ export type McpServerOptions<UserId extends string = string> = {
    * works after sign-in.
    */
   describeTools?: boolean;
+  /**
+   * Cache hints (`ttlMs`, `cacheScope`) advertised on MCP 2026-07-28 responses
+   * (SEP-2549). Defaults: 5 min `"public"` for `server/discover`, 5 min
+   * `"private"` for `tools/list`. Setting `toolsList.cacheScope` to `"public"`
+   * is rejected when any tool requires a `scope`.
+   */
+  cache?: {
+    discover?: CacheHint;
+    toolsList?: CacheHint;
+  };
   accessTokenTtlMs?: number;
   refreshTokenTtlMs?: number;
   /**
@@ -292,6 +316,8 @@ export class McpServer<UserId extends string = string> {
     public options: McpServerOptions<UserId>,
   ) {
     this.path = normalizePath(options.path ?? "/mcp");
+    validateCacheHint(options.cache?.discover, "cache.discover");
+    validateCacheHint(options.cache?.toolsList, "cache.toolsList");
     this.tools = new Map();
     for (const [name, definition] of Object.entries(options.tools)) {
       if (!/^[A-Za-z0-9_.-]{1,128}$/.test(name)) {
@@ -305,6 +331,11 @@ export class McpServer<UserId extends string = string> {
       const args = toObjectValidator(definition.args ?? {});
       const returns: GenericValidator | undefined = definition.returns;
       const outputSchema = returns && toJsonSchema(returns);
+      if (definition.scope && options.cache?.toolsList?.cacheScope === "public") {
+        throw new Error(
+          `cache.toolsList.cacheScope cannot be "public" when tool "${name}" requires a scope`,
+        );
+      }
       this.tools.set(name, {
         name,
         definition,
@@ -654,15 +685,15 @@ export class McpServer<UserId extends string = string> {
           ...(this.options.instructions
             ? { instructions: this.options.instructions }
             : {}),
-          ttlMs: TOOLS_LIST_TTL_MS,
-          cacheScope: "public",
+          ttlMs: this.options.cache?.discover?.ttlMs ?? TOOLS_LIST_TTL_MS,
+          cacheScope: this.options.cache?.discover?.cacheScope ?? "public",
         });
       case "tools/list":
         return result({
           tools: this.listTools(user),
-          ttlMs: TOOLS_LIST_TTL_MS,
-          // The list depends on the caller's scopes.
-          cacheScope: "private",
+          ttlMs: this.options.cache?.toolsList?.ttlMs ?? TOOLS_LIST_TTL_MS,
+          // The list depends on the caller's scopes by default.
+          cacheScope: this.options.cache?.toolsList?.cacheScope ?? "private",
         });
       case "tools/call": {
         const t = this.toolFor(params.name);
@@ -1633,6 +1664,13 @@ async function readForm(request: Request): Promise<URLSearchParams | null> {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validateCacheHint(hint: CacheHint | undefined, name: string) {
+  if (hint?.ttlMs === undefined) return;
+  if (!Number.isFinite(hint.ttlMs) || hint.ttlMs < 0) {
+    throw new Error(`${name}.ttlMs must be a non-negative finite number`);
+  }
 }
 
 function normalizePath(path: string) {
