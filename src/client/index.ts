@@ -97,6 +97,12 @@ export type ContentBlock =
       name: string;
       description?: string;
       mimeType?: string;
+    }
+  | {
+      type: "resource";
+      resource:
+        | { uri: string; mimeType?: string; text: string; _meta?: Record<string, unknown> }
+        | { uri: string; mimeType?: string; blob: string; _meta?: Record<string, unknown> };
     };
 
 export type CallToolResult = {
@@ -182,6 +188,73 @@ export function createTool<UserId extends string>() {
 }
 
 // ---------------------------------------------------------------------------
+// Prompt definitions
+
+/** https://modelcontextprotocol.io/specification/2026-07-28/server/prompts */
+export type PromptArgumentDefinition = {
+  title?: string;
+  description?: string;
+  required?: boolean;
+};
+
+export type PromptArgs<Args extends Record<string, PromptArgumentDefinition>> = {
+  [K in keyof Args as Args[K] extends { required: true } ? K : never]: string;
+} & {
+  [K in keyof Args as Args[K] extends { required: true } ? never : K]?: string;
+};
+
+export type PromptMessage = {
+  role: "user" | "assistant";
+  content: ContentBlock;
+};
+
+export type GetPromptResult = {
+  description?: string;
+  messages: PromptMessage[];
+  _meta?: Record<string, unknown>;
+};
+
+export type PromptDefinition<
+  Args extends Record<string, PromptArgumentDefinition> = Record<string, PromptArgumentDefinition>,
+  UserId extends string = string,
+> = {
+  /** Human-friendly display name. */
+  title?: string;
+  /** What the prompt does. */
+  description?: string;
+  /** String arguments accepted when templating this prompt. */
+  args?: Args;
+  /** App metadata advertised with this prompt in `prompts/list`. */
+  meta?: Record<string, unknown>;
+  /** OAuth scope required to see and get this prompt. Must be in `scopes`. */
+  scope?: string;
+  handler: (
+    ctx: ToolCtx,
+    args: PromptArgs<Args>,
+    user: McpUser<UserId>,
+  ) => Promise<string | PromptMessage[] | GetPromptResult>;
+};
+
+/** Defines a prompt. Identity helper that gives `handler` typed string `args`. */
+export function prompt<
+  const Args extends Record<string, PromptArgumentDefinition> = Record<string, never>,
+>(definition: PromptDefinition<Args>): PromptDefinition<any> {
+  return definition as PromptDefinition<any>;
+}
+
+/**
+ * Returns a `prompt` helper whose handlers see `user.userId` typed as your user
+ * ID type, matching `createTool<UserId>()`.
+ */
+export function createPrompt<UserId extends string>() {
+  return <
+    const Args extends Record<string, PromptArgumentDefinition> = Record<string, never>,
+  >(
+    definition: PromptDefinition<Args, UserId>,
+  ): PromptDefinition<any, UserId> => definition as PromptDefinition<any, UserId>;
+}
+
+// ---------------------------------------------------------------------------
 // Server
 
 export type McpServerOptions<UserId extends string = string> = {
@@ -192,6 +265,11 @@ export type McpServerOptions<UserId extends string = string> = {
   /** Guidance for the model on how to use this server's tools. */
   instructions?: string;
   tools: Record<string, ToolDefinition<any, any, UserId>>;
+  /**
+   * Prompt templates exposed over `prompts/list` and `prompts/get`. Omit to
+   * keep the `prompts` capability unadvertised.
+   */
+  prompts?: Record<string, PromptDefinition<any, UserId>>;
   /**
    * Your app's consent page. Users are sent to `${consentUrl}?request=<id>`;
    * the page signs them in, shows `getAuthRequest`, and calls `authorize`.
@@ -282,8 +360,15 @@ type CompiledTool = {
   listing: Record<string, unknown>;
 };
 
+type CompiledPrompt = {
+  name: string;
+  definition: PromptDefinition<any, any>;
+  listing: Record<string, unknown>;
+};
+
 export class McpServer<UserId extends string = string> {
   private readonly tools: Map<string, CompiledTool>;
+  private readonly prompts: Map<string, CompiledPrompt>;
   readonly path: string;
   private warned = false;
 
@@ -319,6 +404,36 @@ export class McpServer<UserId extends string = string> {
           ...(definition.annotations
             ? { annotations: definition.annotations }
             : {}),
+          ...(definition.meta ? { _meta: definition.meta } : {}),
+        },
+      });
+    }
+    this.prompts = new Map();
+    for (const [name, definition] of Object.entries(options.prompts ?? {})) {
+      if (!name.trim()) {
+        throw new Error(`Invalid MCP prompt name "${name}"`);
+      }
+      if (definition.scope && !options.scopes?.[definition.scope]) {
+        throw new Error(
+          `Prompt "${name}" requires scope "${definition.scope}", which is not in \`scopes\``,
+        );
+      }
+      const argListing = Object.entries(
+        (definition.args ?? {}) as Record<string, PromptArgumentDefinition>,
+      ).map(([argName, argDef]) => ({
+        name: argName,
+        ...(argDef.title ? { title: argDef.title } : {}),
+        ...(argDef.description ? { description: argDef.description } : {}),
+        ...(argDef.required ? { required: true } : {}),
+      }));
+      this.prompts.set(name, {
+        name,
+        definition,
+        listing: {
+          name,
+          ...(definition.title ? { title: definition.title } : {}),
+          ...(definition.description ? { description: definition.description } : {}),
+          ...(argListing.length ? { arguments: argListing } : {}),
           ...(definition.meta ? { _meta: definition.meta } : {}),
         },
       });
@@ -534,6 +649,13 @@ export class McpServer<UserId extends string = string> {
         );
       }
     }
+    for (const p of this.prompts.values()) {
+      if (scopes.length && !p.definition.scope) {
+        findings.push(
+          `Prompt "${p.name}" has no \`scope\`, so every connection (even read-only ones) can read it.`,
+        );
+      }
+    }
     return findings;
   }
 
@@ -672,9 +794,27 @@ export class McpServer<UserId extends string = string> {
         if (!this.allowed(t, user)) return this.insufficientScope(t.definition.scope!);
         return result(await this.callTool(ctx, t, params.arguments ?? {}, user));
       }
-      default:
-        return json(rpcError(id, -32601, `Method not found: ${method}`), 404);
+      case "prompts/list":
+        if (this.prompts.size === 0) break;
+        return result({
+          prompts: this.listPrompts(user),
+          ttlMs: TOOLS_LIST_TTL_MS,
+          // The list depends on the caller's scopes.
+          cacheScope: "private",
+        });
+      case "prompts/get": {
+        if (this.prompts.size === 0) break;
+        const p = this.promptFor(params.name);
+        if (!p) {
+          return json(rpcError(id, -32602, `Unknown prompt: ${String(params.name)}`), 200);
+        }
+        if (!this.promptAllowed(p, user)) return this.insufficientScope(p.definition.scope!);
+        const r = await this.getPrompt(ctx, p, params.arguments, user);
+        if ("error" in r) return json(rpcError(id, r.error.code, r.error.message), 200);
+        return result(r.result);
+      }
     }
+    return json(rpcError(id, -32601, `Method not found: ${method}`), 404);
   }
 
   /** MCP 2025-03-26 through 2025-11-25 (initialize-based, stateless here). */
@@ -757,9 +897,22 @@ export class McpServer<UserId extends string = string> {
         }
         return rpcResult(id, await this.callTool(ctx, t, p.arguments ?? {}, user));
       }
-      default:
-        return rpcError(id, -32601, `Method not found: ${method}`);
+      case "prompts/list":
+        if (this.prompts.size === 0) break;
+        return rpcResult(id, { prompts: this.listPrompts(user) });
+      case "prompts/get": {
+        if (this.prompts.size === 0) break;
+        const pr = this.promptFor(p.name);
+        if (!pr) return rpcError(id, -32602, `Unknown prompt: ${String(p.name)}`);
+        if (!this.promptAllowed(pr, user)) {
+          return this.insufficientScope(pr.definition.scope!);
+        }
+        const r = await this.getPrompt(ctx, pr, p.arguments, user);
+        if ("error" in r) return rpcError(id, r.error.code, r.error.message);
+        return rpcResult(id, r.result);
+      }
     }
+    return rpcError(id, -32601, `Method not found: ${method}`);
   }
 
   private get serverInfo() {
@@ -771,7 +924,10 @@ export class McpServer<UserId extends string = string> {
   }
 
   private get capabilities() {
-    return { tools: { listChanged: false } };
+    return {
+      tools: { listChanged: false },
+      ...(this.prompts.size ? { prompts: { listChanged: false } } : {}),
+    };
   }
 
   /** Tools visible to this connection, in definition order (deterministic). */
@@ -787,6 +943,89 @@ export class McpServer<UserId extends string = string> {
 
   private allowed(t: CompiledTool, user: McpUser<UserId>) {
     return !t.definition.scope || user.scopes.includes(t.definition.scope);
+  }
+
+  /** Prompts visible to this connection, in definition order (deterministic). */
+  private listPrompts(user: McpUser<UserId>) {
+    return [...this.prompts.values()]
+      .filter((p) => this.promptAllowed(p, user))
+      .map((p) => p.listing);
+  }
+
+  private promptFor(name: unknown) {
+    return typeof name === "string" ? this.prompts.get(name) : undefined;
+  }
+
+  private promptAllowed(p: CompiledPrompt, user: McpUser<UserId>) {
+    return !p.definition.scope || user.scopes.includes(p.definition.scope);
+  }
+
+  private async getPrompt(
+    ctx: ToolCtx,
+    p: CompiledPrompt,
+    rawArgs: unknown,
+    user: McpUser<UserId>,
+  ): Promise<
+    | { result: GetPromptResult }
+    | { error: { code: number; message: string } }
+  > {
+    if (rawArgs !== undefined && !isObject(rawArgs)) {
+      return { error: { code: -32602, message: "Invalid arguments: expected object" } };
+    }
+    const input = rawArgs ?? {};
+    const declared = (p.definition.args ?? {}) as Record<string, PromptArgumentDefinition>;
+    const checked: Record<string, string> = {};
+    for (const [k, value] of Object.entries(input)) {
+      if (!(k in declared)) {
+        return { error: { code: -32602, message: `Unexpected argument: ${k}` } };
+      }
+      if (typeof value !== "string") {
+        return { error: { code: -32602, message: `Argument "${k}" must be a string` } };
+      }
+      checked[k] = value;
+    }
+    for (const [k, def] of Object.entries(declared)) {
+      if (def.required && !(k in checked)) {
+        return { error: { code: -32602, message: `Missing required argument: ${k}` } };
+      }
+    }
+    let value: string | PromptMessage[] | GetPromptResult;
+    try {
+      value = await p.definition.handler(ctx, checked, user);
+    } catch (error) {
+      if (error instanceof ConvexError) {
+        const data = error.data;
+        return {
+          error: {
+            code: -32603,
+            message: typeof data === "string" ? data : JSON.stringify(toJsonValue(data)),
+          },
+        };
+      }
+      console.error(`MCP prompt "${p.name}" failed`, error);
+      return { error: { code: -32603, message: "Internal error" } };
+    }
+    const defaultDesc = p.definition.description
+      ? { description: p.definition.description }
+      : {};
+    if (typeof value === "string") {
+      return {
+        result: {
+          ...defaultDesc,
+          messages: [{ role: "user", content: { type: "text", text: value } }],
+        },
+      };
+    }
+    if (Array.isArray(value)) {
+      return { result: { ...defaultDesc, messages: value } };
+    }
+    return {
+      result: {
+        ...(value.description !== undefined ? { description: value.description } : defaultDesc),
+        messages: value.messages,
+        ...(value._meta ? { _meta: value._meta } : {}),
+      },
+    };
   }
 
   private insufficientScope(scope: string) {

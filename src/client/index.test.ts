@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import { ConvexError, v } from "convex/values";
-import { McpServer, callToolResult, tool } from "./index.js";
+import { McpServer, callToolResult, createPrompt, prompt, tool } from "./index.js";
 import { components } from "./setup.test.js";
 
 function server(tools: ConstructorParameters<typeof McpServer>[1]["tools"]) {
@@ -405,5 +405,244 @@ describe("GET /mcp guide", () => {
       tools: { secret_tool: tool({ description: "Internal thing", handler: async () => null }) },
     });
     expect(open.guide()).toContain("secret_tool");
+  });
+});
+
+describe("prompts", () => {
+  const META = "io.modelcontextprotocol/";
+  const meta = {
+    [`${META}protocolVersion`]: "2026-07-28",
+    [`${META}clientCapabilities`]: {},
+  };
+
+  async function modernPost(
+    s: McpServer,
+    method: string,
+    params: Record<string, unknown> = {},
+    scopes = ["read", "write"],
+    headers: Record<string, string> = {},
+  ) {
+    const res = await s.handleMcp(
+      ctx(scopes),
+      new Request("https://site.example/mcp", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer key",
+          "Content-Type": "application/json",
+          "MCP-Protocol-Version": "2026-07-28",
+          "Mcp-Method": method,
+          ...(typeof params.name === "string" ? { "Mcp-Name": params.name } : {}),
+          ...headers,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { ...params, _meta: meta } }),
+      }),
+    );
+    return { status: res.status, headers: res.headers, body: await res.json() };
+  }
+
+  const withPrompts = () => {
+    const typedPrompt = createPrompt<string>();
+    return new McpServer(components.mcp, {
+      name: "test",
+      version: "1",
+      consentUrl: "https://example.com/connect",
+      siteUrl: "https://site.example",
+      scopes: { read: "Read", write: "Write" },
+      tools: {},
+      prompts: {
+        review: prompt({
+          title: "Review list",
+          description: "Review a list for the user",
+          args: {
+            list: { description: "List name", required: true },
+            tone: { description: "Optional tone" },
+          },
+          scope: "read",
+          meta: { "com.example/category": "review" },
+          handler: async (_ctx, args, user) => {
+            const list: string = args.list;
+            const tone: string | undefined = args.tone;
+            return `Review ${list} for ${user.userId} (${tone ?? "concise"})`;
+          },
+        }),
+        convo: typedPrompt({
+          description: "Multi-turn prompt with embedded resource",
+          scope: "write",
+          handler: async () => [
+            { role: "user", content: { type: "text", text: "Check this doc" } },
+            {
+              role: "assistant",
+              content: {
+                type: "resource",
+                resource: { uri: "app://doc/1", mimeType: "text/plain", text: "Hello" },
+              },
+            },
+          ],
+        }),
+        custom: prompt({
+          description: "Default description",
+          scope: "read",
+          handler: async () => ({
+            description: "Custom description",
+            messages: [{ role: "user", content: { type: "text", text: "hi" } }],
+            _meta: { "com.example/tag": "v1" },
+          }),
+        }),
+        fail_convex: prompt({
+          description: "Throws ConvexError",
+          scope: "read",
+          handler: async () => {
+            throw new ConvexError("List not found");
+          },
+        }),
+        fail_secret: prompt({
+          description: "Throws internal error",
+          scope: "read",
+          handler: async () => {
+            throw new Error("db secret hunter2");
+          },
+        }),
+      },
+    });
+  };
+
+  test("capability is advertised only when prompts exist", async () => {
+    const without = server({});
+    const legacyWithout = await call(without, ctx(), rpc("initialize", { protocolVersion: "2025-11-25" }), "2025-11-25");
+    expect(legacyWithout.body.result.capabilities).toEqual({ tools: { listChanged: false } });
+    expect((await call(without, ctx(), rpc("prompts/list"))).body.error.code).toBe(-32601);
+    const modernWithout = await modernPost(without, "prompts/list");
+    expect(modernWithout.status).toBe(404);
+    expect(modernWithout.body.error.code).toBe(-32601);
+
+    const withThem = withPrompts();
+    const legacyWith = await call(withThem, ctx(), rpc("initialize", { protocolVersion: "2025-11-25" }), "2025-11-25");
+    expect(legacyWith.body.result.capabilities.prompts).toEqual({ listChanged: false });
+    const discover = await modernPost(withThem, "server/discover");
+    expect(discover.body.result.capabilities.prompts).toEqual({ listChanged: false });
+  });
+
+  test("prompts/list filters by scope and includes cache hints on 2026-07-28 only", async () => {
+    const s = withPrompts();
+    const legacy = await call(s, ctx(["read"]), rpc("prompts/list"), "2025-11-25");
+    expect(legacy.body.result.prompts.map((p: any) => p.name)).toEqual([
+      "review",
+      "custom",
+      "fail_convex",
+      "fail_secret",
+    ]);
+    expect(legacy.body.result.prompts[0]).toEqual({
+      name: "review",
+      title: "Review list",
+      description: "Review a list for the user",
+      arguments: [
+        { name: "list", description: "List name", required: true },
+        { name: "tone", description: "Optional tone" },
+      ],
+      _meta: { "com.example/category": "review" },
+    });
+    expect("ttlMs" in legacy.body.result).toBe(false);
+
+    const modernList = await modernPost(s, "prompts/list", {}, ["read", "write"]);
+    expect(modernList.body.result).toMatchObject({
+      resultType: "complete",
+      cacheScope: "private",
+    });
+    expect(modernList.body.result.ttlMs).toBeGreaterThan(0);
+    expect(modernList.body.result.prompts.map((p: any) => p.name)).toContain("convo");
+  });
+
+  test("prompts/get handles string, messages array, and full result with _meta", async () => {
+    const s = withPrompts();
+    const str = await modernPost(s, "prompts/get", {
+      name: "review",
+      arguments: { list: "Groceries", tone: "brief" },
+    });
+    expect(str.status).toBe(200);
+    expect(str.body.result).toMatchObject({
+      resultType: "complete",
+      description: "Review a list for the user",
+      messages: [
+        { role: "user", content: { type: "text", text: "Review Groceries for user1 (brief)" } },
+      ],
+    });
+
+    const arr = await call(s, ctx(), rpc("prompts/get", { name: "convo" }), "2025-11-25");
+    expect(arr.body.result).toEqual({
+      description: "Multi-turn prompt with embedded resource",
+      messages: [
+        { role: "user", content: { type: "text", text: "Check this doc" } },
+        {
+          role: "assistant",
+          content: {
+            type: "resource",
+            resource: { uri: "app://doc/1", mimeType: "text/plain", text: "Hello" },
+          },
+        },
+      ],
+    });
+
+    const full = await modernPost(s, "prompts/get", { name: "custom" });
+    expect(full.body.result.description).toBe("Custom description");
+    expect(full.body.result._meta).toEqual({
+      "com.example/tag": "v1",
+      [`${META}serverInfo`]: { name: "test", version: "1" },
+    });
+  });
+
+  test("prompts/get validates name, scopes, arguments, Mcp-Name, and errors", async () => {
+    const s = withPrompts();
+
+    // Unknown prompt
+    expect((await modernPost(s, "prompts/get", { name: "nope" })).body.error.code).toBe(-32602);
+    expect((await call(s, ctx(), rpc("prompts/get", { name: "nope" }))).body.error.code).toBe(-32602);
+
+    // Out-of-scope prompt
+    const denied = await modernPost(s, "prompts/get", { name: "convo" }, ["read"]);
+    expect(denied.status).toBe(403);
+    expect(denied.headers.get("WWW-Authenticate")).toContain('scope="write"');
+
+    // Missing required argument, non-string argument, unknown argument
+    expect((await modernPost(s, "prompts/get", { name: "review" })).body.error.code).toBe(-32602);
+    expect(
+      (await modernPost(s, "prompts/get", { name: "review", arguments: { list: 123 } })).body.error.code,
+    ).toBe(-32602);
+    expect(
+      (await modernPost(s, "prompts/get", { name: "review", arguments: { list: "ok", extra: "bad" } })).body
+        .error.code,
+    ).toBe(-32602);
+
+    // Mcp-Name header mismatch on 2026-07-28
+    const badHeader = await modernPost(s, "prompts/get", { name: "custom" }, ["read"], {
+      "Mcp-Name": "other",
+    });
+    expect(badHeader.status).toBe(400);
+    expect(badHeader.body.error.code).toBe(-32020);
+
+    // ConvexError message passes through; unknown errors do not leak
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const convexErr = await modernPost(s, "prompts/get", { name: "fail_convex" });
+    const secretErr = await modernPost(s, "prompts/get", { name: "fail_secret" });
+    spy.mockRestore();
+    expect(convexErr.body.error).toEqual({ code: -32603, message: "List not found" });
+    expect(secretErr.body.error.code).toBe(-32603);
+    expect(secretErr.body.error.message).not.toContain("hunter2");
+  });
+
+  test("rejects prompts with undeclared scopes", () => {
+    expect(
+      () =>
+        new McpServer(components.mcp, {
+          name: "t",
+          version: "1",
+          consentUrl: "https://example.com/connect",
+          siteUrl: "https://site.example",
+          scopes: { read: "Read" },
+          tools: {},
+          prompts: {
+            x: prompt({ description: "x", scope: "admin", handler: async () => "hi" }),
+          },
+        }),
+    ).toThrow(/scope "admin"/);
   });
 });
